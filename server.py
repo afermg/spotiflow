@@ -36,6 +36,15 @@ from spotiflow.model import Spotiflow
 
 address = sys.argv[1]
 
+# Module-level model cache. Re-call ``setup()`` with the same
+# (pretrained_name, weights_path, device) tuple as the previous call and
+# we reuse the loaded model instead of reinstantiating + re-pulling
+# weights. The aliby pipeline calls ``dispatch_segmenter`` → ``setup()``
+# once per position, so without this cache a long extraction run can
+# reload the model hundreds of times per server — and reload latency
+# can push concurrent client requests past the IPC ``recv_timeout``.
+_MODEL_CACHE: dict[tuple, tuple] = {}
+
 
 def setup(
     pretrained_name: str = "general",
@@ -78,25 +87,34 @@ def setup(
         torch_device = torch.device("cpu")
         map_location = "cpu"
 
-    # Spotiflow's from_pretrained / from_folder accepts only the strings
-    # ``"auto"``, ``"cpu"``, ``"cuda"``, ``"mps"`` for ``map_location``
-    # — not ``"cuda:0"`` or a ``torch.device``. We load to "cuda"
-    # generically then ``.to()`` the underlying nn.Module onto the
-    # specific GPU index after.
-    if weights_path is not None:
-        model = Spotiflow.from_folder(weights_path, map_location=map_location)
+    # Reuse the already-loaded model if the same setup args show up
+    # again — most aliby workflows hit setup() once per position with
+    # identical params, and reload cost (network fetch + state_dict
+    # load + .to(device)) is large compared to per-image inference.
+    cache_key = (pretrained_name, weights_path, int(device))
+    cached = _MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        model, _cached_torch_device = cached
     else:
-        model = Spotiflow.from_pretrained(
-            pretrained_name, map_location=map_location
-        )
+        # Spotiflow's from_pretrained / from_folder accepts only the
+        # strings ``"auto"``, ``"cpu"``, ``"cuda"``, ``"mps"`` for
+        # ``map_location`` — not ``"cuda:0"`` or a ``torch.device``.
+        # Load to ``"cuda"`` generically, then ``.to()`` the underlying
+        # nn.Module onto the specific CUDA index.
+        if weights_path is not None:
+            model = Spotiflow.from_folder(
+                weights_path, map_location=map_location
+            )
+        else:
+            model = Spotiflow.from_pretrained(
+                pretrained_name, map_location=map_location
+            )
 
-    if torch.cuda.is_available() and int(device) != 0:
-        # Move the wrapped torch model onto the requested CUDA index.
-        # Spotiflow exposes the underlying nn.Module as ``.model`` —
-        # this is what predict() runs forward through.
-        model.model.to(torch_device)
+        if torch.cuda.is_available() and int(device) != 0:
+            model.model.to(torch_device)
 
-    model.eval()
+        model.eval()
+        _MODEL_CACHE[cache_key] = (model, torch_device)
 
     info = {
         "device": str(torch_device),
