@@ -23,6 +23,7 @@ or:
 """
 
 import sys
+from pathlib import Path
 from functools import partial
 from typing import Callable
 
@@ -49,7 +50,7 @@ _MODEL_CACHE: dict[tuple, tuple] = {}
 def setup(
     pretrained_name: str = "general",
     weights_path: str | None = None,
-    device: int | None = None,
+    device: int | str | None = None,
     prob_thresh: float | None = None,
     spot_radius_px: int = 3,
     min_distance: int = 1,
@@ -63,8 +64,9 @@ def setup(
         ``synth_complex`` …). Ignored if ``weights_path`` is set.
     weights_path : str | None
         Local checkpoint directory. Bypasses ``from_pretrained``.
-    device : int | None
-        CUDA device index. ``None`` → cuda:0 if available, else cpu.
+    device : int | str | None
+        CUDA device index or torch device string. ``None`` selects cuda:0
+        when available and otherwise CPU.
     prob_thresh : float | None
         Spot-probability cut. ``None`` keeps the model's trained default
         (typically ~0.4–0.5 for ``general``).
@@ -79,19 +81,24 @@ def setup(
         that the heatmap splits.
     """
     if device is None:
-        device = 0
-    if torch.cuda.is_available():
-        torch_device = torch.device(int(device))
-        map_location = "cuda"
+        torch_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    elif isinstance(device, int):
+        torch_device = torch.device(f"cuda:{device}")
     else:
-        torch_device = torch.device("cpu")
-        map_location = "cpu"
+        torch_device = torch.device(device)
+    if torch_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"CUDA device {torch_device} was requested but CUDA is unavailable"
+        )
+    map_location = "cuda" if torch_device.type == "cuda" else "cpu"
+    if weights_path is not None and not Path(weights_path).exists():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {weights_path}")
 
     # Reuse the already-loaded model if the same setup args show up
     # again — most aliby workflows hit setup() once per position with
     # identical params, and reload cost (network fetch + state_dict
     # load + .to(device)) is large compared to per-image inference.
-    cache_key = (pretrained_name, weights_path, int(device))
+    cache_key = (pretrained_name, weights_path, str(torch_device))
     cached = _MODEL_CACHE.get(cache_key)
     if cached is not None:
         model, _cached_torch_device = cached
@@ -102,15 +109,13 @@ def setup(
         # Load to ``"cuda"`` generically, then ``.to()`` the underlying
         # nn.Module onto the specific CUDA index.
         if weights_path is not None:
-            model = Spotiflow.from_folder(
-                weights_path, map_location=map_location
-            )
+            model = Spotiflow.from_folder(weights_path, map_location=map_location)
         else:
             model = Spotiflow.from_pretrained(
                 pretrained_name, map_location=map_location
             )
 
-        if torch.cuda.is_available() and int(device) != 0:
+        if torch_device.type == "cuda" and torch_device.index not in (None, 0):
             model.model.to(torch_device)
 
         model.eval()
@@ -183,9 +188,7 @@ def process(
         if min_distance is not None:
             predict_kwargs["min_distance"] = min_distance
         coords, _details = model.predict(img, device=device, **predict_kwargs)
-        out[n] = _coords_to_label_mask(
-            numpy.asarray(coords), (Y, X), spot_radius_px
-        )
+        out[n] = _coords_to_label_mask(numpy.asarray(coords), (Y, X), spot_radius_px)
     return out
 
 
